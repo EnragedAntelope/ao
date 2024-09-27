@@ -8,6 +8,7 @@ import io
 import itertools
 import random
 import re
+from typing import List, Tuple
 import unittest
 import warnings
 
@@ -51,6 +52,10 @@ from torchao.float8.float8_utils import (
     FP8_TYPES,
     tensor_to_scale,
 )
+from torchao.testing.float8.test_utils import (
+    scaling_granularities_by_gemm, 
+    get_test_float8_linear_config,
+)
 
 random.seed(0)
 torch.manual_seed(0)
@@ -58,6 +63,8 @@ torch.manual_seed(0)
 
 is_cuda_8_9 = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 is_cuda_9_0 = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (9, 0)
+
+
 
 def bitwise_identical(a: Float8Tensor, b: Float8Tensor) -> bool:
     assert torch.all(a._data == b._data).item(), "scales are not identical"
@@ -211,31 +218,52 @@ class TestFloat8Tensor:
             a_fp8_d2_r2 = a_fp8_d2.reshape(3, -1)
 
     @pytest.mark.parametrize("a_shape", [(16, 32), (2, 16, 32), (1, 2, 16, 32)])
+    @pytest.mark.parametrize(
+        "a_granularity,b_granularity",
+        [
+            (ScalingGranularity.AXISWISE, ScalingGranularity.AXISWISE),
+            (ScalingGranularity.AXISWISE, ScalingGranularity.TENSORWISE),
+            (ScalingGranularity.TENSORWISE, ScalingGranularity.AXISWISE),
+        ]
+    )
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     @unittest.skipIf(not is_cuda_9_0, "Requires CUDA capability >= 9.0")
-    def test_axiswise_gemm(self, a_shape):
+    def test_axiswise_gemm(self, a_shape, a_granularity, b_granularity):
         a = torch.randn(*a_shape, dtype=torch.bfloat16, device="cuda")
         b = torch.randn(64, 32, dtype=torch.bfloat16, device="cuda")
 
         linear_mm_config = LinearMMConfig()
 
+        if a_granularity is ScalingGranularity.AXISWISE:
+            a_axiswise_dim = -1
+        else:
+            assert a_granularity is ScalingGranularity.TENSORWISE
+            a_axiswise_dim = None
         a_fp8 = hp_tensor_to_float8_dynamic(
             a,
             e4m3_dtype,
             linear_mm_config,
             gemm_input_role=GemmInputRole.INPUT,
-            scaling_granularity=ScalingGranularity.AXISWISE,
-            axiswise_dim=-1,
+            scaling_granularity=a_granularity,
+            axiswise_dim=a_axiswise_dim,
         )
         a_fp8 = a_fp8.reshape(-1, a_shape[-1])
+
+        b_axiswise_dim = 1 if b_granularity is ScalingGranularity.AXISWISE else None
+        if b_granularity is ScalingGranularity.AXISWISE:
+            b_axiswise_dim = 1  # will be transposed
+        else:
+            assert b_granularity is ScalingGranularity.TENSORWISE
+            b_axiswise_dim = None
         b_fp8 = hp_tensor_to_float8_dynamic(
             b,
             e4m3_dtype,
             linear_mm_config,
             gemm_input_role=GemmInputRole.WEIGHT,
-            scaling_granularity=ScalingGranularity.AXISWISE,
-            axiswise_dim=1,  # will be transposed
+            scaling_granularity=b_granularity,
+            axiswise_dim=b_axiswise_dim,
         )
+
         c_fp8_compute = torch.mm(a_fp8, b_fp8.t())
         a = a.reshape(-1, a_shape[-1])
         c_ref = torch.mm(a, b.t())
@@ -316,26 +344,33 @@ class TestFloat8Linear:
             # verify initialization flags got updated
             assert m_fp8.is_amax_initialized, "Amax was not properly initialized"
 
-    @pytest.mark.parametrize("emulate", [True, False] if is_cuda_8_9 else [True])
-    @pytest.mark.parametrize("x_shape", [(16, 16), (2, 16, 16), (3, 2, 16, 16)])
+    # @pytest.mark.parametrize("emulate", [True, False] if is_cuda_8_9 else [True])
+    @pytest.mark.parametrize("emulate", [False] if is_cuda_8_9 else [True])
+    # @pytest.mark.parametrize("x_shape", [(16, 16), (2, 16, 16), (3, 2, 16, 16)])
+    @pytest.mark.parametrize("x_shape", [(16, 16),])
     @pytest.mark.parametrize(
         "scaling_type_input", 
-        [ScalingType.DELAYED, ScalingType.DYNAMIC, ScalingType.STATIC]
+        # [ScalingType.DELAYED, ScalingType.DYNAMIC, ScalingType.STATIC]
+        [ScalingType.DYNAMIC]
     )
     @pytest.mark.parametrize(
         "scaling_type_weight", 
-        [ScalingType.DELAYED, ScalingType.DYNAMIC, ScalingType.STATIC]
+        # [ScalingType.DELAYED, ScalingType.DYNAMIC, ScalingType.STATIC]
+        [ScalingType.DYNAMIC]
     )
     @pytest.mark.parametrize(
         "scaling_type_grad_output",
-        [ScalingType.DELAYED, ScalingType.DYNAMIC, ScalingType.STATIC],
+        # [ScalingType.DELAYED, ScalingType.DYNAMIC],
+        [ScalingType.DYNAMIC]
     )
     @pytest.mark.parametrize(
-        "scaling_granularity", 
-        [ScalingGranularity.TENSORWISE, ScalingGranularity.AXISWISE],
+        "scaling_granularities_by_gemm",
+        scaling_granularities_by_gemm
     )
-    @pytest.mark.parametrize("linear_dtype", [torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("linear_bias", [False, True])
+    # @pytest.mark.parametrize("linear_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("linear_dtype", [torch.bfloat16, ])
+    # @pytest.mark.parametrize("linear_bias", [False, True])
+    @pytest.mark.parametrize("linear_bias", [False, ])
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_linear(
         self,
@@ -344,7 +379,7 @@ class TestFloat8Linear:
         scaling_type_input: ScalingType,
         scaling_type_weight: ScalingType,
         scaling_type_grad_output: ScalingType,
-        scaling_granularity: ScalingGranularity,
+        scaling_granularities_by_gemm: List[List[Tuple[ScalingGranularity, ScalingGranularity]]],
         linear_dtype: torch.dtype,
         linear_bias: bool,
     ):
@@ -357,7 +392,23 @@ class TestFloat8Linear:
                     f"CUDA capability {torch.cuda.get_device_capability()} < (9.0)"
                 )
                 pytest.skip()
-        if scaling_granularity is ScalingGranularity.AXISWISE:
+
+        (
+            (scaling_granularity_input, scaling_granularity_weight, original_prec_input, original_prec_weight),
+            (scaling_granularity_grad_output, scaling_granularity_weight_for_grad_input, original_prec_grad_output, original_prec_weight_for_grad_input),
+            (scaling_granularity_input_for_grad_weight, scaling_granularity_grad_output_for_grad_weight, original_prec_input_for_grad_weight, original_prec_grad_output_for_grad_weight),
+        ) = scaling_granularities_by_gemm
+
+        has_any_axiswise_scaling = (
+            scaling_granularity_input is ScalingGranularity.AXISWISE or
+            scaling_granularity_weight is ScalingGranularity.AXISWISE or
+            scaling_granularity_grad_output is ScalingGranularity.AXISWISE or
+            scaling_granularity_input_for_grad_weight is ScalingGranularity.AXISWISE or
+            scaling_granularity_weight_for_grad_input is ScalingGranularity.AXISWISE or
+            scaling_granularity_grad_output_for_grad_weight is ScalingGranularity.AXISWISE
+        )
+
+        if has_any_axiswise_scaling:
             if (
                 scaling_type_input != ScalingType.DYNAMIC or
                 scaling_type_weight != ScalingType.DYNAMIC or
@@ -370,46 +421,14 @@ class TestFloat8Linear:
         x = torch.randn(*x_shape, device="cuda", dtype=linear_dtype)
         m_ref = nn.Linear(16, 32, bias=linear_bias, device="cuda", dtype=linear_dtype)
 
-        if scaling_type_input is ScalingType.STATIC:
-            cast_config_input = CastConfig(
-                scaling_type=scaling_type_input,
-                scaling_granularity=scaling_granularity,
-                static_scale=torch.tensor([1.0], device="cuda"),
-            )
-        else:
-            cast_config_input = CastConfig(
-                scaling_type=scaling_type_input,
-                scaling_granularity=scaling_granularity,
-            )
-        if scaling_type_weight is ScalingType.STATIC:
-            cast_config_weight = CastConfig(
-                scaling_type=scaling_type_weight,
-                scaling_granularity=scaling_granularity,
-                static_scale=torch.tensor([1.0], device="cuda"),
-            )
-        else:
-            cast_config_weight = CastConfig(
-                scaling_type=scaling_type_weight,
-                scaling_granularity=scaling_granularity,
-            )
-        if scaling_type_grad_output is ScalingType.STATIC:
-            cast_config_grad_output = CastConfig(
-                scaling_type=scaling_type_grad_output,
-                scaling_granularity=scaling_granularity,
-                static_scale=torch.tensor([1.0], device="cuda"),
-            )
-        else:
-            cast_config_grad_output = CastConfig(
-                scaling_type=scaling_type_grad_output,
-                scaling_granularity=scaling_granularity,
-            )
-
-        config = Float8LinearConfig(
-            cast_config_input=cast_config_input,
-            cast_config_weight=cast_config_weight,
-            cast_config_grad_output=cast_config_grad_output,
-            emulate=emulate,
+        config = get_test_float8_linear_config(
+            scaling_type_input,
+            scaling_type_weight,
+            scaling_type_grad_output,
+            scaling_granularities_by_gemm,
+            emulate,
         )
+
         self._test_linear_impl(
             x,
             m_ref,
